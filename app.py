@@ -20,6 +20,7 @@ import uvicorn
 from langchain_openai import ChatOpenAI
 import json
 import time as _time
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 app = Flask(__name__)
 
@@ -32,6 +33,7 @@ N8N_MARKDOWN_URL = 'http://localhost:5678/webhook/convert/markdown'
 N8N_VECTOR_URL = 'http://localhost:5678/webhook/convert/vector'
 WHISPER_MODEL = 'large-v3'  # whisper模型名，可根据需要修改
 MAPPING_FILE = os.path.join(RAGDATA_DIR, 'mapping.txt')
+MESSAGE_LOG_FILE = os.path.join(RAGDATA_DIR, 'message_log.txt')
 
 # ====== 向量化相关配置 ======
 QDRANT_URL = "http://localhost:6333"
@@ -152,10 +154,13 @@ def process_md_to_vector(md_path, file_uid):
             collection_name=QDRANT_COLLECTION,
             vectors_config=rest.VectorParams(size=1536, distance=rest.Distance.COSINE)
         )
-    # 3. 读取Markdown内容，构建LangChain文档对象
+    # 3. 读取Markdown内容，分块后构建LangChain文档对象
     with open(md_path, 'r', encoding='utf-8') as f:
         content = f.read()
-    # 检查是否已存在该file_uid
+    # 使用RecursiveCharacterTextSplitter分块
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    docs = splitter.create_documents([content], metadatas=[{"file_uid": file_uid, "path": md_path}])
+    # 检查是否已存在该file_uid，存在则删除（全量覆盖）
     search_result = client.scroll(
         collection_name=QDRANT_COLLECTION,
         scroll_filter=rest.Filter(
@@ -166,19 +171,17 @@ def process_md_to_vector(md_path, file_uid):
                 )
             ]
         ),
-        limit=1
+        limit=1000
     )
-    doc = Document(page_content=content, metadata={"file_uid": file_uid, "path": md_path})
     if search_result and search_result[0]:
-        # 存在则更新（upsert）
         print(f"Qdrant已存在file_uid={file_uid}，执行upsert...")
         ids = [point.id for point in search_result[0]]
         client.delete(
             collection_name=QDRANT_COLLECTION,
             points_selector=rest.PointIdsList(points=ids)
         )
-    vectorstore.add_documents([doc])
-    print(f"已写入Qdrant向量库: {file_uid}")
+    vectorstore.add_documents(docs)
+    print(f"已分块写入Qdrant向量库: {file_uid}，共{len(docs)}块")
 
 def main_loop():
     print('启动本地资料监控处理服务...')
@@ -364,6 +367,19 @@ def send_feishu_message(receive_id, content, msg_type="text", receive_id_type="c
     print(f'飞书API发送消息结果: {resp.text}')
     return resp.json()
 
+def is_duplicate_message(message_id):
+    if not os.path.exists(MESSAGE_LOG_FILE):
+        return False
+    with open(MESSAGE_LOG_FILE, 'r', encoding='utf-8') as f:
+        for line in f:
+            if line.strip() == message_id:
+                return True
+    return False
+
+def log_message_id(message_id):
+    with open(MESSAGE_LOG_FILE, 'a', encoding='utf-8') as f:
+        f.write(message_id + '\n')
+
 @app.route('/feishu/event', methods=['POST'])
 def feishu_event():
     data = request.json
@@ -376,6 +392,13 @@ def feishu_event():
         event = data.get('event', {})
         # 只处理文本消息
         if event.get('type') == 'message' and event.get('message_type') == 'text':
+            message_id = event.get('message_id', '')
+            if not message_id:
+                return jsonify({'code': 0})
+            if is_duplicate_message(message_id):
+                print(f'检测到重复message_id: {message_id}，忽略处理')
+                return jsonify({'code': 0})
+            log_message_id(message_id)
             user_id = event.get('sender', {}).get('sender_id', {}).get('user_id')
             chat_id = event.get('chat_id')
             text = event.get('text', '')
@@ -401,6 +424,13 @@ def feishu_event():
         event = data.get('event', {})
         message = event.get('message', {})
         chat_id = message.get('chat_id')
+        message_id = message.get('message_id', '')
+        if not message_id:
+            return jsonify({'code': 0})
+        if is_duplicate_message(message_id):
+            print(f'检测到重复message_id: {message_id}，忽略处理')
+            return jsonify({'code': 0})
+        log_message_id(message_id)
         content_str = message.get('content', '')
         import json as _json
         try:
