@@ -5,10 +5,13 @@ import os
 import time
 import hashlib
 import shutil
-from datetime import datetime
-from pymongo import MongoClient
 import requests
 import threading
+import json
+import time as _time
+import pdfplumber
+from datetime import datetime
+from pymongo import MongoClient
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import Qdrant
 from langchain_core.documents import Document
@@ -16,11 +19,11 @@ from qdrant_client import QdrantClient
 from qdrant_client.http import models as rest
 from fastapi import FastAPI
 from pydantic import BaseModel
-import uvicorn
 from langchain_openai import ChatOpenAI
-import json
-import time as _time
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+import fitz  # PyMuPDF
+import pytesseract
+from pdf2image import convert_from_path
 
 app = Flask(__name__)
 
@@ -28,7 +31,7 @@ app = Flask(__name__)
 MONGO_URI = 'mongodb://admin:admin123@localhost:27017/ragdata?authSource=admin'
 DB_NAME = 'ragdata'
 RAGDATA_DIR = 'E:\\Docker\\RAGData'  # 中间文件存放目录
-SCAN_INTERVAL = 60  # 扫描间隔（秒）
+SCAN_INTERVAL = 120  # 扫描间隔（秒）
 N8N_MARKDOWN_URL = 'http://localhost:5678/webhook/convert/markdown'
 N8N_VECTOR_URL = 'http://localhost:5678/webhook/convert/vector'
 WHISPER_MODEL = 'large-v3'  # whisper模型名，可根据需要修改
@@ -135,14 +138,58 @@ def append_mapping(file_uid, file_path):
     with open(MAPPING_FILE, 'a', encoding='utf-8') as f:
         f.write(f'{file_uid}\t{file_path}\n')
 
-def request_markdown_async(file_uid, text_path):
-    # 向n8n异步请求markdown生成
+# 新增：token计数与分割工具
+try:
+    import tiktoken
+except ImportError:
+    tiktoken = None
+    print('警告：未安装tiktoken库，token计数功能不可用。请pip install tiktoken')
+
+def count_tokens(text, model_name='gpt-3.5-turbo'):
+    if not tiktoken:
+        return len(text)
+    enc = tiktoken.encoding_for_model(model_name)
+    return len(enc.encode(text))
+
+def split_text_by_token(text, max_tokens=49000, model_name='gpt-3.5-turbo'):
+    """
+    按最大token数分割文本，优先按最后一个换行符分割。
+    返回分片列表。
+    """
+    if not tiktoken:
+        # 兜底：按字符粗略分割
+        avg = max_tokens * 2  # 粗略估算
+        return [text[i:i+avg] for i in range(0, len(text), avg)]
+    enc = tiktoken.encoding_for_model(model_name)
+    tokens = enc.encode(text)
+    idx = 0
+    result = []
+    while idx < len(tokens):
+        end = min(idx + max_tokens, len(tokens))
+        chunk = enc.decode(tokens[idx:end])
+        # 优先按最后一个换行符分割
+        if end < len(tokens):
+            last_nl = chunk.rfind('\n')
+            if last_nl > 0:
+                chunk = chunk[:last_nl+1]
+                end = idx + len(enc.encode(chunk))
+        result.append(chunk)
+        idx = end
+    return result
+
+# 修改request_markdown_async，支持分片
+
+def request_markdown_async(file_uid, text_path, chunk_idx=None):
     with open(text_path, 'r', encoding='utf-8') as f:
         text = f.read()
-    try:
-        requests.post(N8N_MARKDOWN_URL, json={'file_uid': file_uid, 'text': text}, timeout=3)
-    except Exception as e:
-        print(f'n8n异步请求异常: {e}')
+    # 判断是否需要分片
+    chunks = split_text_by_token(text, max_tokens=49000)
+    for i, chunk in enumerate(chunks):
+        payload = {'file_uid': f'{file_uid}_part{i+1}' if len(chunks)>1 else file_uid, 'text': chunk}
+        try:
+            requests.post(N8N_MARKDOWN_URL, json=payload, timeout=3)
+        except Exception as e:
+            print(f'n8n异步请求异常: {e}')
 
 def process_md_to_vector(md_path, file_uid):
     # 1. 初始化embedding和Qdrant client
@@ -160,21 +207,21 @@ def process_md_to_vector(md_path, file_uid):
     # 使用RecursiveCharacterTextSplitter分块
     splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
     docs = splitter.create_documents([content], metadatas=[{"file_uid": file_uid, "path": md_path}])
-    # 检查是否已存在该file_uid，存在则删除（全量覆盖）
+    # 检查是否已存在该file_uid或其分片，存在则删除（全量覆盖）
     search_result = client.scroll(
         collection_name=QDRANT_COLLECTION,
         scroll_filter=rest.Filter(
             must=[
                 rest.FieldCondition(
                     key="metadata.file_uid",
-                    match=rest.MatchValue(value=file_uid)
+                    match=rest.MatchText(text=file_uid)
                 )
             ]
         ),
         limit=1000
     )
     if search_result and search_result[0]:
-        print(f"Qdrant已存在file_uid={file_uid}，执行upsert...")
+        print(f"Qdrant已存在file_uid(含分片)={file_uid}，执行upsert...")
         ids = [point.id for point in search_result[0]]
         client.delete(
             collection_name=QDRANT_COLLECTION,
@@ -182,6 +229,51 @@ def process_md_to_vector(md_path, file_uid):
         )
     vectorstore.add_documents(docs)
     print(f"已分块写入Qdrant向量库: {file_uid}，共{len(docs)}块")
+
+def pdf_to_text(pdf_path, text_path, dir_id=None, file_uid=None):
+    doc = fitz.open(pdf_path)
+    text_content = ""
+    # 计算图片保存目录
+    if dir_id and file_uid:
+        img_dir = os.path.join(RAGDATA_DIR, str(dir_id))
+        ensure_dir(img_dir)
+    else:
+        img_dir = os.path.dirname(text_path)
+    for i, page in enumerate(doc):
+        print(f" - 正在处理第{i+1}页...")
+        images = page.get_images(full=True)
+        if images:
+            ocr_text = ""
+            for img_index, img in enumerate(images):
+                xref = img[0]
+                if dir_id and file_uid:
+                    img_path = os.path.join(img_dir, f"{file_uid}_page{i+1}_img{img_index+1}.png")
+                else:
+                    img_path = os.path.join(img_dir, f"temp_page_{i+1}_img_{img_index+1}.png")
+                # 如果图片已存在，直接用现有图片
+                if not os.path.exists(img_path):
+                    try:
+                        pix = fitz.Pixmap(doc, xref)
+                        if pix.n > 4:
+                            pix = fitz.Pixmap(fitz.csRGB, pix)
+                        pix.save(img_path)
+                        pix = None
+                    except Exception as e:
+                        print(f"保存图片出错: {img_path}, 错误: {e}")
+                        continue  # 跳过本图片
+                # OCR识别，遇到错误跳过
+                try:
+                    ocr_text += pytesseract.image_to_string(img_path, lang='chi_sim+eng') + "\n"
+                except Exception as e:
+                    print(f"OCR图片出错: {img_path}, 错误: {e}")
+                    continue  # 跳过本图片
+            text_content += f"{ocr_text}\n"
+        else:
+            text = page.get_text()
+            if text.strip():
+                text_content += f"{text}\n"
+    with open(text_path, 'w', encoding='utf-8') as f:
+        f.write(text_content)
 
 def main_loop():
     print('启动本地资料监控处理服务...')
@@ -267,7 +359,7 @@ def main_loop():
                         elif proc_state == ProcState.RAW_TEXT:
                             print(f'即将异步请求n8n生成markdown: {text_path}')
                             request_markdown_async(base_name, text_path)
-                            print(f'已请求n8n生成markdown，等待回调: {fname}')
+                            print(f'已请求n8n生成markdown（如超长将自动分片），等待回调: {fname}')
                             break
                         elif proc_state == ProcState.MARKDOWN:
                             print(f'即将写入向量库: {md_path}')
@@ -276,6 +368,15 @@ def main_loop():
                             print(f'已写入向量库: {fname}')
                         elif proc_state == ProcState.VECTOR:
                             break  # 已是最终状态，不再处理
+                        elif proc_state == ProcState.NEW and ext == '.pdf':
+                            print(f'检测到PDF文件，直接抽取文本: {fname} -> {text_path}')
+                            pdf_to_text(video_path, text_path, dir_id=dir_id, file_uid=base_name)
+                            update_file_state(dir_id, fname, {'proc_state': ProcState.RAW_TEXT, 'last_proc_time': now})
+                            print(f'PDF已抽取为原始文本: {fname}')
+                            # 自动异步请求n8n生成markdown
+                            request_markdown_async(base_name, text_path)
+                            print(f'已请求n8n生成markdown（如超长将自动分片），等待回调: {fname}')
+                            break
                         else:
                             break  # 没有可推进的步骤，跳出循环
                     except Exception as e:
@@ -302,22 +403,29 @@ def save_markdown():
     if lines and lines[-1].strip() == '```':
         lines = lines[:-1]
     text = '\n'.join(lines)
-    # 查找所有dir_id下的md_path
-    for dir_cfg in dir_index_col.find({'enabled': True}):
-        dir_id = str(dir_cfg['_id'])
-        rag_dir = os.path.join(RAGDATA_DIR, dir_id)
-        md_path = os.path.join(rag_dir, file_uid + '.md')
-        if os.path.exists(rag_dir):
-            # 保存markdown
-            with open(md_path, 'w', encoding='utf-8') as f:
-                f.write(text)
-            # 更新状态
-            rec = dir_file_state_col.find_one({'dir_id': dir_id, 'file_uid': file_uid})
-            if rec:
-                update_file_state(dir_id, rec['file_name'], {'proc_state': ProcState.MARKDOWN, 'last_proc_time': int(time.time())})
-            print(f'收到n8n回调并保存markdown: {md_path}')
-            return jsonify({'status': 'ok'})
-    return jsonify({'status': 'fail', 'msg': '未找到file_uid'}), 404
+    # 判断是否分片
+    is_part = '_part' in file_uid
+    # 获取主file_uid
+    main_file_uid = file_uid.split('_part')[0] if is_part else file_uid
+    # 查找主文件的dir_id
+    rec = dir_file_state_col.find_one({'file_uid': main_file_uid})
+    if not rec:
+        return jsonify({'status': 'fail', 'msg': '未找到file_uid'}), 404
+    dir_id = rec['dir_id']
+    rag_dir = os.path.join(RAGDATA_DIR, dir_id)
+    if not os.path.exists(rag_dir):
+        os.makedirs(rag_dir)
+    md_path = os.path.join(rag_dir, file_uid + '.md')
+    # 保存markdown
+    with open(md_path, 'w', encoding='utf-8') as f:
+        f.write(text)
+    # 分片直接写入向量库
+    process_md_to_vector(md_path, file_uid)
+    print(f'收到n8n回调并保存markdown: {md_path}，已写入向量库')
+    # 非分片才推进主文件状态
+    if not is_part:
+        update_file_state(dir_id, rec['file_name'], {'proc_state': ProcState.MARKDOWN, 'last_proc_time': int(time.time())})
+    return jsonify({'status': 'ok'})
 
 def answer_question(question, top_k=3):
     docs = vectorstore.similarity_search(question, k=top_k)
@@ -345,7 +453,11 @@ def get_tenant_access_token():
         return _feishu_token_cache['token']
     url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal/"
     resp = requests.post(url, json={"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET})
-    token = resp.json().get("tenant_access_token")
+    resp_json = resp.json()
+    if "tenant_access_token" not in resp_json:
+        print("获取飞书token失败，返回内容：", resp_json)
+        raise Exception("飞书token获取失败，请检查app_id/app_secret和网络")
+    token = resp_json.get("tenant_access_token")
     expire = now + 7100  # 官方2小时，提前100秒刷新
     _feishu_token_cache['token'] = token
     _feishu_token_cache['expire'] = expire
